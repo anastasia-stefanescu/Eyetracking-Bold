@@ -1,0 +1,14 @@
+Predictii bold, 6 epoci, fara 5-fold:
+
+Media erorii absolute:  0.27093758357141606
+Media pred           : 0.09617357657750283
+Media reala          : -0.02480586339721334
+lang_LH_AntTemp -> corr: -0.3459606929896099
+
+Predictii bold, 10 epoci, fara 5-fold:
+
+Media erorii absolute:  0.24842685082397178
+Media pred           : -0.034458575767868795
+Media reala          : -0.02480586339721334
+lang_LH_AntTemp -> corr: 0.06278274978198667
+
