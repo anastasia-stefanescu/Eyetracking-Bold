@@ -12,19 +12,21 @@ import numpy as np
 import torch.nn as nn
 import pytorch_lightning as pl
 
-from transformers import BertTokenizer
+from transformers import BertTokenizer, BertForSequenceClassification
 
+from sklearn.metrics import mean_squared_error
 from sklearn.model_selection import KFold
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import MinMaxScaler
-  # Or other metrics suitable for your task
+from sklearn.metrics import accuracy_score  # Or other metrics suitable for your task
 
 #from pprint import pprint
 
 from torch.optim import AdamW
-from torch.utils.data import DataLoader, Dataset
-from torch.ao.quantization.qconfig import float_qparams_weight_only_qconfig
-from transformers import AutoTokenizer, AutoModel, AutoConfig
+from torch.utils.data import DataLoader, Dataset, TensorDataset
+#from pytorch_lightning import LightningModule, Trainer
+#from pytorch_lightning.callbacks import EarlyStopping
+from transformers import AutoTokenizer, AutoModel, AutoConfig, TrainingArguments
 
 
 
@@ -100,6 +102,7 @@ class CustomCollator:
     
     
 
+
 class BERTModel(pl.LightningModule):
     def __init__(self, model_name: str, lr: float = 2e-5, sequence_max_length: int = MAX_SEQ_LEN):
         super().__init__()
@@ -111,22 +114,20 @@ class BERTModel(pl.LightningModule):
         # Load the model configuration and set output_hidden_states=True
         self.model_config = AutoConfig.from_pretrained(model_name, output_hidden_states=True)
         
-        self.model = AutoModel.from_pretrained(model_name, config = self.model_config)   
+        self.model = AutoModel.from_pretrained(model_name, config = self.model_config)
         self.output_layer = nn.Linear(self.model.config.hidden_size, 1)  # One output unit for regression
         self.loss_fct = nn.MSELoss()
         self.lr = lr
         self.save_hyperparameters()
 
-        if use_static_quantized_model == 1:
-        #     # Set up quantization configuration
-        #     self.qconfig = torch.quantization.get_default_qconfig('qnnpack')
-        #     # Apply a specific quantization configuration for the embedding layers
-        #     self.model.embeddings.qconfig = float_qparams_weight_only_qconfig
-        #     # Insert quantization stubs in the model
-            self.quant = torch.quantization.QuantStub()
-            self.dequant = torch.quantization.DeQuantStub()
-            # # Prepare the model for quantization
-            # torch.quantization.prepare(self, inplace=True)
+        # fbgemm / qnnpack
+        self.qconfig = torch.quantization.get_default_qat_qconfig('fbgemm')
+
+         # Additional configuration for QAT
+        self.qat_prepared = False  # To ensure we only prepare QAT once
+
+        # # Prepare quantization-aware layers (this modifies the model in-place)
+        # self.prepare_qat_model()
 
 
         if using_only_layer5 == 1:
@@ -141,11 +142,22 @@ class BERTModel(pl.LightningModule):
             for param in self.output_layer.parameters():
                 param.requires_grad = True
 
-        # self.gpu_available = torch.cuda.is_available()
-        # if self.gpu_available:
-        #     print(f"GPU is available: {torch.cuda.get_device_name(0)}")
-        # else:
-        #     print("GPU is not available, using CPU.")
+        self.gpu_available = torch.cuda.is_available()
+        if self.gpu_available:
+            print(f"GPU is available: {torch.cuda.get_device_name(0)}")
+        else:
+            print("GPU is not available, using CPU.")
+
+    def prepare_qat(self):
+        if not self.qat_prepared:
+                # Prepare the model for QAT
+                self.model = torch.quantization.prepare_qat(self.model, inplace=False)
+                self.qat_prepared = True
+
+
+    def convert_to_quantized(self):
+        """Convert the model to a fully quantized version after training."""
+        self.model = torch.quantization.convert(self.model.eval(), inplace=False)
 
     def forward(self, input_ids, attention_mask):
         """
@@ -154,6 +166,7 @@ class BERTModel(pl.LightningModule):
         :param attention_mask: Tensor of attention masks.
         :return: Predictions for the input batch.
         """
+        # Pass input_ids and attention_mask to the base model
         output = self.model(input_ids=input_ids, attention_mask=attention_mask, return_dict=True)
         
         if using_only_layer5 == 1:
@@ -161,59 +174,29 @@ class BERTModel(pl.LightningModule):
             hidden_states = output.hidden_states
             layer_5_output = hidden_states[4]  # 5th block's output
 
-            if use_static_quantized_model == 1:
-                # Quantize the layer_5_output before using it for regression
-                quantized_layer_5_output = self.quant(layer_5_output)
-
-                # Use the [CLS] token's representation from the 5th block for regression
-                cls_embedding = quantized_layer_5_output[:, 0, :]  # [CLS] token embedding
-            else:
-                # Use the [CLS] token's representation from the 5th block for regression
-                cls_embedding = layer_5_output[:, 0, :]  # [CLS] token embedding
+            # Use the [CLS] token's representation from the 5th block for regression
+            cls_embedding = layer_5_output[:, 0, :]  # [CLS] token embedding
             
             # Pass through the output layer (regression head)
-            prediction = self.output_layer(cls_embedding).flatten()
-
-            return prediction
+            return self.output_layer(cls_embedding).flatten()
 
         else:
-            if use_static_quantized_model == 1:
-                # Quantize the pooler output before applying the output layer
-                quantized_pooler_output = self.quant(output.pooler_output)
+            # Apply the output layer to the pooled output of the model
+            return self.output_layer(output.pooler_output).flatten()
 
-                # Apply the output layer to the quantized pooled output
-                prediction = self.output_layer(quantized_pooler_output).flatten()
-            else:
-                # Apply the output layer to the pooled output of the model
-                prediction = self.output_layer(output.pooler_output).flatten()
 
-            return prediction
-        
-    def prepare_custom_quantization(self):
-        # Set the default qconfig for the entire model
-        self.qconfig = torch.quantization.get_default_qconfig('qnnpack')
-
-        # Manually set qconfig=None for normalization layers to skip quantization
-        for i in range(len(self.model.encoder.layer)):
-            self.model.encoder.layer[i].attention.output.LayerNorm.qconfig = None
-            self.model.encoder.layer[i].output.LayerNorm.qconfig = None
-
-        # Set the correct quantization configuration for embeddings
-        self.model.embeddings.qconfig = torch.quantization.float_qparams_weight_only_qconfig
-
-        # Now prepare the model for quantization
-        torch.quantization.prepare(self.model, inplace=True)
-    
-    def convert_custom_quantization(self):
-        # Perform the conversion to quantized model
-        torch.quantization.convert(self.model, inplace=True)
-            
     def training_step(self, batch, batch_idx):
         """
         :param batch: The batch of data.
         :param batch_idx: Index of the batch.
         :return: A dictionary containing the loss.
         """
+
+        self.train()  # This ensures the model is in training mode
+
+        # Prepare for QAT if not already done
+        self.prepare_qat()
+
         # Prepare the tokenized batch
         input_ids = batch['input_ids']
         attention_mask = batch['attention_mask']
@@ -279,20 +262,6 @@ class BERTModel(pl.LightningModule):
         self.val_preds = []
         self.val_labels = []
 
-    def quantize_model(self): #dynamically!
-        # Apply dynamic quantization to the entire model
-        self.model = torch.quantization.quantize_dynamic(
-            self.model, {torch.nn.Linear}, dtype=torch.qint8
-        )
-        
-        # Also quantize the output layer (if necessary)
-        self.output_layer = torch.quantization.quantize_dynamic(
-            self.output_layer, {torch.nn.Linear}, dtype=torch.qint8
-        )
-
-        # Return quantized model for any further use
-        return self
-
     def configure_optimizers(self):
         return AdamW([p for p in self.parameters() if p.requires_grad], lr=self.lr, eps=1e-08)
 
@@ -310,6 +279,7 @@ def predict(model, tokenizer, sentence):
     # Move tokenized input to the same device as the model
     tokenized_input = {key: value.to(next(model.parameters()).device) for key, value in tokenized_input.items()}
 
+    # aici modificat
     with torch.no_grad():  # Turn off gradient computation for inference
         predictions = model(input_ids=tokenized_input['input_ids'], attention_mask=tokenized_input['attention_mask'])
 
@@ -318,7 +288,10 @@ def predict(model, tokenizer, sentence):
     return prediction_score
 
 def evaluate_model_on_tests(model, lista, output_file, column):
-    model.eval()  # Set the model to evaluation mode.
+
+    model.convert_to_quantized() # !!! atentie aici
+
+    model.eval()  
 
     device = next(model.parameters()).device  # Get the device of the model's parameters.
 
@@ -408,26 +381,11 @@ def prepare(df, y, column):
     (model, _) = train(train_dataloader, validation_dataloader)
     get_results(model, test_df, 'rez_testing_3ep.csv', column)
 
-def quantize_model(model):
-    quantized_model = torch.quantization.quantize_dynamic(
-        model, {torch.nn.Linear}, dtype=torch.qint8  # Quantizing only Linear layers
-    )
-    return quantized_model
 
-def calibrate_model(model, dataloader):
-    model.eval()
-    with torch.no_grad():
-        for batch in dataloader:
-            input_ids = batch['input_ids']
-            attention_mask = batch['attention_mask']
-            model(input_ids=input_ids, attention_mask=attention_mask)
 
 if __name__ == '__main__':
     import multiprocessing
     multiprocessing.set_start_method('spawn', force=True)  # Ensures safe multiprocessing on MacOS
-
-    # Enable the quantization backend for ARM
-    torch.backends.quantized.engine = 'qnnpack'
 
     tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
     scaler = MinMaxScaler()
@@ -442,9 +400,7 @@ if __name__ == '__main__':
 
     using_train_test_split = 1
     using_only_layer5 = 0
-    testing_eyetracking = 1
-    use_dynamically_quantized_model = 0
-    use_static_quantized_model = 1
+    testing_eyetracking = 1 #comparing with eyetracking
 
     if testing_eyetracking == 0:
         if using_train_test_split == 1: ############train - test - split
@@ -528,23 +484,10 @@ if __name__ == '__main__':
             MODEL_PATH = "bert-base-uncased"  # or your custom model path
             model = BERTModel(model_name=MODEL_PATH)
 
-            if use_dynamically_quantized_model == 1:
-                # Quantize the model after training
-                quantized_model = model.quantize_model()
-
-                # Now you can save or use the quantized model for efficient inference
-                torch.save(quantized_model.state_dict(), "quantized_model.pt")
-            else:
-                if use_static_quantized_model == 1:
-                    model.prepare_custom_quantization()
-                    calibrate_model(model, val_dataloader)
-                    #quantize the model
-                    model.convert_custom_quantization()
-
             trainer = pl.Trainer(
                 devices=-1,  # Comment this when training on cpu
                 accelerator="gpu",
-                max_epochs=1,  # Set this to -1 when training fully
+                max_epochs=3,  # Set this to -1 when training fully
                 limit_train_batches=6,  # Uncomment this when training fully
                 limit_val_batches=5,  # Uncomment this when training fully
                 gradient_clip_val=1.0,
@@ -554,10 +497,7 @@ if __name__ == '__main__':
             )
 
             #Training
-            if use_dynamically_quantized_model == 1:
-                trainer.fit(quantized_model, train_dataloader, val_dataloader)
-            else:
-                trainer.fit(model, train_dataloader, val_dataloader)
+            trainer.fit(model, train_dataloader, val_dataloader)
 
             pth = inc+'lightning_logs/'
             if os.path.exists(pth):
@@ -566,14 +506,7 @@ if __name__ == '__main__':
 
             df_test = pd.read_csv(inc + 'datasets/zuco/train_sent.csv')
             
-            if use_dynamically_quantized_model == 1:
-               get_results(quantized_model, df_test, 'quant_bold_6ep.csv', col)
-            else:
-                if use_static_quantized_model == 1:
-                    model.convert_custom_quantization()
-                    get_results(model, df_test, 'static_quant_zuco_bold_1ep.csv', col)
-                else:
-                    get_results(model, df_test, 'corr_zuco_bold_10ep.csv', col)
+            get_results(model, df_test, 'bold_quantised_3ep.csv', col)
 
 
 
