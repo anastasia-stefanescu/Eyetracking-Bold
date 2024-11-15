@@ -101,7 +101,7 @@ class CustomCollator:
     
 
 class BERTModel(pl.LightningModule):
-    def __init__(self, model_name: str, lr: float = 1e-4, sequence_max_length: int = MAX_SEQ_LEN):
+    def __init__(self, model_name: str, lr: float = 2e-5, sequence_max_length: int = MAX_SEQ_LEN):
         super().__init__()
 
         self.val_preds = []
@@ -441,10 +441,10 @@ if __name__ == '__main__':
     columns = ['lang_LH_AntTemp', 'lang_LH_IFG','lang_LH_IFGorb','lang_LH_MFG','lang_LH_PostTemp','lang_LH_netw']
 
     using_train_test_split = 1
-    using_only_layer5 = 1
+    using_only_layer5 = 0
     testing_eyetracking = 1
-    use_dynamically_quantized_model = 1
-    use_static_quantized_model = 0
+    use_dynamically_quantized_model = 0
+    use_static_quantized_model = 1
 
     if testing_eyetracking == 0:
         if using_train_test_split == 1: ############train - test - split
@@ -567,7 +567,7 @@ if __name__ == '__main__':
             df_test = pd.read_csv(inc + 'datasets/zuco/train_sent.csv')
             
             if use_dynamically_quantized_model == 1:
-               get_results(quantized_model, df_test, 'quant_bold_1ep.csv', col)
+               get_results(quantized_model, df_test, 'quant_bold_6ep.csv', col)
             else:
                 if use_static_quantized_model == 1:
                     model.convert_custom_quantization()
