@@ -2,6 +2,7 @@ import pandas as pd
 import csv
 import os
 import shutil
+import multiprocessing
 from scipy.stats import pearsonr
 
 import logging
@@ -17,9 +18,6 @@ from transformers import BertTokenizer
 from sklearn.model_selection import KFold
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import MinMaxScaler
-  # Or other metrics suitable for your task
-
-#from pprint import pprint
 
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset
@@ -52,9 +50,7 @@ def scalare(x, minimum, maximum):
 
 class CustomDataset(Dataset):
     def __init__(self, df):
-        # self.samples = [{"content": row['sentence'], "class": row[col]} for _, row in df.iterrows()]
         self.samples = [{"content": row['sentence'], "class": scalare(row[col], minimum, maximum)} for _, row in df.iterrows()]
-
 
     def __len__(self):
         return len(self.samples)
@@ -423,11 +419,13 @@ def calibrate_model(model, dataloader):
             model(input_ids=input_ids, attention_mask=attention_mask)
 
 if __name__ == '__main__':
-    import multiprocessing
+    
     multiprocessing.set_start_method('spawn', force=True)  # Ensures safe multiprocessing on MacOS
 
     # Enable the quantization backend for ARM
     torch.backends.quantized.engine = 'qnnpack'
+
+    #torch.device("mps") # for Unsloth
 
     tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
     scaler = MinMaxScaler()
